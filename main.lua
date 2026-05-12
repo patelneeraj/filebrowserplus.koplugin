@@ -6,6 +6,7 @@ local DataStorage = require("datastorage")
 local Device = require("device")
 local Dispatcher = require("dispatcher")
 local InfoMessage = require("ui/widget/infomessage") -- luacheck:ignore
+local QRMessage = require("ui/widget/qrmessage")
 local InputDialog = require("ui/widget/inputdialog")
 local UIManager = require("ui/uimanager")
 local WidgetContainer = require("ui/widget/container/widgetcontainer")
@@ -334,6 +335,40 @@ function FilebrowserPlus:show_dataPath_dialog(touchmenu_instance)
     self.dataPath_dialog:onShowKeyboard()
 end
 
+function FilebrowserPlus:showIPQRCode()
+    local ip_info = nil
+
+    if Device.retrieveNetworkInfo then
+        local net_info = Device:retrieveNetworkInfo()
+
+        if type(net_info) == "table" and net_info.ip then
+            ip_info = net_info.ip
+        elseif type(net_info) == "string" then
+            ip_info = net_info:match("(%d+%.%d+%.%d+%.%d+)")
+        end
+    end
+
+    if not ip_info then
+        UIManager:show(InfoMessage:new{
+            icon = "notice-warning",
+            text = _("Could not retrieve IP address."),
+        })
+        return
+    end
+
+    local qr_text = string.format(
+        "http://%s:%s",
+        ip_info,
+        self.filebrowserplus_port
+    )
+
+    UIManager:show(QRMessage:new{
+        text = qr_text,
+        width = Device.screen:getWidth(),
+        height = Device.screen:getHeight(),
+    })
+end
+
 function FilebrowserPlus:addToMainMenu(menu_items)
     menu_items.filebrowserplus = {
         text = _("FilebrowserPlus"),
@@ -352,6 +387,20 @@ function FilebrowserPlus:addToMainMenu(menu_items)
                 ffiutil.sleep(1)
                 touchmenu_instance:updateItems()
             end
+        }, {
+
+            text = _("Show IP as QR code"),
+
+            keep_menu_open = true,
+
+            enabled_func = function()
+                return self:isRunning()
+            end,
+
+            callback = function()
+                self:showIPQRCode()
+            end
+
         }, {
             text_func = function()
                 return T(_("FilebrowserPlus port (%1)"), self.filebrowserplus_port)
