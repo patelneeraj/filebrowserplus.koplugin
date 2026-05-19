@@ -24,7 +24,7 @@ local plugin_path = path .. "/plugins/filebrowserplus.koplugin/filebrowser"
 local silence_cmd = ""
 -- uncomment below to prevent cmd output from cluttering up crash.log
 silence_cmd = " > /dev/null 2>&1"
-local pid_path = "/tmp/filebrowserplus_koreader.pid"
+local pid_path = path .. "/filebrowserplus_koreader.pid"
 local bin_path = plugin_path .. "/filebrowser"
 
 local filebrowser_args = string.format("-d %s -c %s ", db_path, config_path)
@@ -39,6 +39,52 @@ if not util.pathExists(bin_path) then
 elseif os.execute("test -x '" .. bin_path .. "'") ~= 0 then
     logger.info("[FilebrowserPlus] binary not executable, attempting to fix permissions")
     os.execute("chmod +x " .. bin_path)
+end
+
+-- On Android, /sdcard is mounted noexec so the binary cannot be executed in-place
+-- regardless of its permission bits. Copy it to the app's internal files directory
+-- (/data/data/<pkg>/files) which is on the exec-capable /data partition.
+if Device:isAndroid() then
+    local function android_files_dir()
+        -- /proc/self/cmdline starts with the package name (null-terminated) on Android.
+        local f = io.open("/proc/self/cmdline", "rb")
+        if not f then return nil end
+        local pkg = f:read("*a"):match("^([^%z]+)")
+        f:close()
+        if not pkg or pkg == "" then return nil end
+        -- Primary path; on Android 8+ this is usually a symlink to /data/user/0/<pkg>
+        local dir = "/data/data/" .. pkg .. "/files"
+        if os.execute(string.format("test -d %q", dir)) == 0 then
+            return dir
+        end
+        -- Explicit multi-user path for the default user (user 0)
+        dir = "/data/user/0/" .. pkg .. "/files"
+        if os.execute(string.format("test -d %q", dir)) == 0 then
+            return dir
+        end
+        return nil
+    end
+
+    local exec_dir = android_files_dir() or "/data/local/tmp"
+    local android_bin = exec_dir .. "/filebrowserplus"
+
+    local function _fsize(p)
+        local f = io.open(p, "rb")
+        if not f then return nil end
+        local sz = f:seek("end")
+        f:close()
+        return sz
+    end
+
+    if _fsize(bin_path) ~= _fsize(android_bin) then
+        logger.info("[FilebrowserPlus] Copying binary to " .. exec_dir .. " (Android noexec workaround)")
+        os.execute(string.format("mkdir -p %q && cp %q %q && chmod +x %q",
+            exec_dir, bin_path, android_bin, android_bin))
+    elseif os.execute(string.format("test -x %q", android_bin)) ~= 0 then
+        os.execute(string.format("chmod +x %q", android_bin))
+    end
+    bin_path = android_bin
+    filebrowser_cmd = bin_path .. " " .. filebrowser_args
 end
 
 local FilebrowserPlus = WidgetContainer:extend{
@@ -175,7 +221,10 @@ function FilebrowserPlus:start()
         os.execute(enable_auth_cmd)
     end
 
-    local cmd = string.format("nohup %q -a 0.0.0.0 -r %q -p %s -l %q %s & echo $! > %q", bin_path,
+    -- > /dev/null 2>&1 before the & prevents the backgrounded process from
+    -- inheriting the pipe that os.execute() reads, which would cause KOReader
+    -- to block indefinitely waiting for the pipe to close.
+    local cmd = string.format("nohup %q -a 0.0.0.0 -r %q -p %s -l %q %s > /dev/null 2>&1 & echo $! > %q", bin_path,
         self.filebrowserplus_dataPath, self.filebrowserplus_port, log_path, filebrowser_args, pid_path)
 
     logger.info("[FilebrowserPlus] Launching Filebrowser:", cmd)
@@ -387,8 +436,17 @@ function FilebrowserPlus:getIPAddress()
         if type(net_info) == "table" and net_info.ip then
             return net_info.ip
         elseif type(net_info) == "string" then
-            return net_info:match("(%d+%.%d+%.%d+%.%d+)") or nil
+            local ip = net_info:match("(%d+%.%d+%.%d+%.%d+)")
+            if ip then return ip end
         end
+    end
+    -- Fallback: ask the kernel which source address it would use to reach the
+    -- internet. Works reliably on Android where retrieveNetworkInfo may be absent.
+    local f = io.popen("ip route get 1 2>/dev/null")
+    if f then
+        local route = f:read("*a")
+        f:close()
+        return route:match("src%s+(%d+%.%d+%.%d+%.%d+)") or nil
     end
     return nil
 end
