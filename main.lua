@@ -8,6 +8,7 @@ local Dispatcher = require("dispatcher")
 local InfoMessage = require("ui/widget/infomessage") -- luacheck:ignore
 local InputDialog = require("ui/widget/inputdialog")
 local UIManager = require("ui/uimanager")
+local TouchMenu = require("ui/widget/touchmenu")
 local WidgetContainer = require("ui/widget/container/widgetcontainer")
 local ffiutil = require("ffi/util")
 local logger = require("logger")
@@ -51,10 +52,22 @@ function FilebrowserPlus:init()
     self.allow_no_password = G_reader_settings:isTrue("FilebrowserPlus_allow_no_password")
     self.autostart = G_reader_settings:isTrue("FilebrowserPlus_autostart")
     self.filebrowserplus_dataPath = G_reader_settings:readSetting("FilebrowserPlus_dataPath") or "/"
-
+    self.auto_stop_minutes = G_reader_settings:readSetting("FilebrowserPlus_auto_stop_minutes") or 30
+    self.auto_stop_task = function()
+        self:checkAutoStop()
+    end
+    self.auto_stop_scheduled = false
     if self.autostart then
         logger.info("[FilebrowserPlus] Autostart enabled, starting server on port " .. self.filebrowserplus_port)
         self:start()
+    end
+
+    -- Restore auto-stop timer if server is running (e.g. after KOReader restart)
+    -- This resets the timer to the full duration
+    if self:isRunning() and self.auto_stop_minutes > 0 and not self.auto_stop_scheduled then
+        logger.info("[FilebrowserPlus] Server found running, restoring auto-stop timer.")
+        self.stop_deadline = os.time() + (self.auto_stop_minutes * 60)
+        self:checkAutoStop()
     end
 
     self.ui.menu:registerToMainMenu(self)
@@ -169,42 +182,67 @@ function FilebrowserPlus:start()
     local status = os.execute(cmd)
 
     if status == 0 then
-        -- Try to get IP address only
-        local ip_info = ""
-        if Device.retrieveNetworkInfo then
-            local net_info = Device:retrieveNetworkInfo()
-            if type(net_info) == "table" and net_info.ip then
-                ip_info = net_info.ip
-            elseif type(net_info) == "string" then
-                -- In case the function returns a string (some devices do)
-                ip_info = net_info:match("(%d+%.%d+%.%d+%.%d+)") or _("Unknown IP")
-            else
-                ip_info = _("Unknown IP")
-            end
-        else
-            ip_info = _("Could not retrieve IP address.")
-        end
-
         -- Add default credentials if it's the first setup
         local extra_info = ""
+        local timeout_duration = 3
         if self.filebrowserplus_first_setup then
             extra_info = _("\n\nDefault username: admin\nDefault password: admin12345678")
+            timeout_duration = 15
+        end
+
+        local auto_stop_msg = ""
+        if self.auto_stop_minutes and self.auto_stop_minutes > 0 then
+            auto_stop_msg = "\n" .. T(_("Auto-stop in %1 min"), self.auto_stop_minutes)
         end
 
         local info = InfoMessage:new{
-            timeout = 15,
-            text = T(_("FilebrowserPlus server started.\n\nPort: %1\nIP Address: %2%3"), self.filebrowserplus_port,
-                ip_info, extra_info)
+            timeout = timeout_duration,
+            text = _("FilebrowserPlus server started.") .. auto_stop_msg .. extra_info
         }
         UIManager:show(info)
+        
+        -- Schedule auto-stop if configured
+        if self.auto_stop_minutes and self.auto_stop_minutes > 0 then
+            self.stop_deadline = os.time() + (self.auto_stop_minutes * 60)
+            self:checkAutoStop()
+            logger.info("[FilebrowserPlus] Auto-stop scheduled in " .. self.auto_stop_minutes .. " minutes (Deadline: " .. os.date("%c", self.stop_deadline) .. ").")
+        end
     else
         local info = InfoMessage:new{
             icon = "notice-warning",
-            text = _("Failed to start FilebrowserPlus server.")
+            timeout = 15,
+            text = _("Failed to start FilebrowserPlus server")
         }
         UIManager:show(info)
     end
 
+end
+
+function FilebrowserPlus:checkAutoStop()
+    if not self:isRunning() then
+        self.auto_stop_scheduled = false
+        return
+    end
+
+    if not self.stop_deadline then
+        self.auto_stop_scheduled = false
+        return
+    end
+
+    if os.time() >= self.stop_deadline then
+        logger.info("[FilebrowserPlus] Auto-stop timer expired, stopping server.")
+        self.auto_stop_scheduled = false
+        self:stop(true)
+        UIManager:show(InfoMessage:new{
+            text = _("FilebrowserPlus server auto-stopped after timeout"),
+            timeout = 3
+        })
+    else
+        local remaining = self.stop_deadline - os.time()
+        local next_check = math.min(60, math.max(1, remaining))
+        self.auto_stop_scheduled = true
+        UIManager:scheduleIn(next_check, self.auto_stop_task)
+    end
 end
 
 function FilebrowserPlus:isRunning()
@@ -236,7 +274,14 @@ function FilebrowserPlus:isRunning()
     end
 end
 
-function FilebrowserPlus:stop()
+function FilebrowserPlus:stop(is_auto)
+    -- Cancel auto-stop timer if running
+    if self.auto_stop_scheduled and self.auto_stop_task then
+        UIManager:unschedule(self.auto_stop_task)
+        self.auto_stop_scheduled = false
+    end
+    self.stop_deadline = nil    
+    
     local cmd = string.format("if [ -f '%s' ]; then kill $(cat '%s') 2>/dev/null; rm -f '%s'; fi", pid_path, pid_path,
         pid_path)
     logger.info("[FilebrowserPlus] Stopping Filebrowser:", cmd)
@@ -244,26 +289,28 @@ function FilebrowserPlus:stop()
 
     if status == 0 then
         logger.info("[FilebrowserPlus] Filebrowser stopped.")
-        UIManager:show(InfoMessage:new{
-            text = _("FilebrowserPlus server stopped."),
-            timeout = 2
-        })
+        if not is_auto then
+            UIManager:show(InfoMessage:new{
+                text = _("FilebrowserPlus server stopped."),
+                timeout = 3
+            })
+        end
 
         if Device:isKindle() then
-        os.execute(string.format("%s %s %s", "iptables -D INPUT -p tcp --dport", self.filebrowserplus_port,
-            "-m conntrack --ctstate NEW,ESTABLISHED -j ACCEPT"))
-        os.execute(string.format("%s %s %s", "iptables -D OUTPUT -p tcp --sport", self.filebrowserplus_port,
-            "-m conntrack --ctstate ESTABLISHED -j ACCEPT"))
-    end
+            os.execute(string.format("%s %s %s", "iptables -D INPUT -p tcp --dport", self.filebrowserplus_port,
+                "-m conntrack --ctstate NEW,ESTABLISHED -j ACCEPT"))
+            os.execute(string.format("%s %s %s", "iptables -D OUTPUT -p tcp --sport", self.filebrowserplus_port,
+                "-m conntrack --ctstate ESTABLISHED -j ACCEPT"))
+        end
     else
         logger.info("[FilebrowserPlus] Failed to stop Filebrowser, status:", status)
         UIManager:show(InfoMessage:new{
             icon = "notice-warning",
-            text = _("Failed to stop Filebrowser.")
+            timeout = 15,
+            text = _("Failed to stop Filebrowser")
         })
     end
 
-    
 end
 
 function FilebrowserPlus:onToggleFilebrowserPlusServer()
@@ -334,80 +381,162 @@ function FilebrowserPlus:show_dataPath_dialog(touchmenu_instance)
     self.dataPath_dialog:onShowKeyboard()
 end
 
+function FilebrowserPlus:getIPAddress()
+    if Device.retrieveNetworkInfo then
+        local net_info = Device:retrieveNetworkInfo()
+        if type(net_info) == "table" and net_info.ip then
+            return net_info.ip
+        elseif type(net_info) == "string" then
+            return net_info:match("(%d+%.%d+%.%d+%.%d+)") or nil
+        end
+    end
+    return nil
+end
+
+function FilebrowserPlus:show_autostop_dialog(touchmenu_instance)
+    self.autostop_dialog = InputDialog:new{
+        title = _("Auto-stop timeout (min)"),
+        description = _("Set to 0 to disable"),
+        input = tostring(self.auto_stop_minutes),
+        input_type = "number",
+        buttons = {{{
+            text = _("Cancel"),
+            id = "close",
+            callback = function()
+                UIManager:close(self.autostop_dialog)
+            end
+        }, {
+            text = _("Save"),
+            is_enter_default = true,
+            callback = function()
+                local value = tonumber(self.autostop_dialog:getInputText())
+                if value and value >= 0 then
+                    self.auto_stop_minutes = value
+                    G_reader_settings:saveSetting("FilebrowserPlus_auto_stop_minutes", value)
+                    UIManager:close(self.autostop_dialog)
+                    touchmenu_instance:updateItems()
+                end
+            end
+        }}}
+    }
+    UIManager:show(self.autostop_dialog)
+    self.autostop_dialog:onShowKeyboard()
+end
+
 function FilebrowserPlus:addToMainMenu(menu_items)
+    local sub_item_table = {{
+        text_func = function()
+            return T(_("FilebrowserPlus port (%1)"), self.filebrowserplus_port)
+        end,
+        keep_menu_open = true,
+        enabled_func = function()
+            return not self:isRunning()
+        end,
+        callback = function(touchmenu_instance)
+            self:show_port_dialog(touchmenu_instance)
+        end
+    }, {
+        text_func = function()
+            return T(_("FilebrowserPlus Data Path (%1)"), self.filebrowserplus_dataPath)
+        end,
+        keep_menu_open = true,
+        enabled_func = function()
+            return not self:isRunning()
+        end,
+        callback = function(touchmenu_instance)
+            self:show_dataPath_dialog(touchmenu_instance)
+        end
+    }, {
+        text = _("Reset Admin User Password"),
+        keep_menu_open = true,
+        enabled_func = function()
+            return not self:isRunning()
+        end,
+        callback = function(touchmenu_instance)
+            self:resetPassword()
+        end
+    }, {
+        text = _("Login without password (DANGEROUS)"),
+        checked_func = function()
+            return self.allow_no_password
+        end,
+        enabled_func = function()
+            return not self:isRunning()
+        end,
+        callback = function()
+            self.allow_no_password = not self.allow_no_password
+            G_reader_settings:flipNilOrFalse("FilebrowserPlus_allow_no_password")
+        end
+    }, {
+        text = _("Start FilebrowserPlus server with KOReader"),
+        checked_func = function()
+            return self.autostart
+        end,
+        enabled_func = function()
+            return not self:isRunning()
+        end,
+        callback = function()
+            self.autostart = not self.autostart
+            G_reader_settings:flipNilOrFalse("FilebrowserPlus_autostart")
+        end
+    }, {
+        text_func = function()
+            if self.auto_stop_minutes and self.auto_stop_minutes > 0 then
+                return T(_("Auto-stop timeout (%1 min)"), self.auto_stop_minutes)
+            else
+                return _("Auto-stop timeout (disabled)")
+            end
+        end,
+        keep_menu_open = true,
+        enabled_func = function()
+            return not self:isRunning()
+        end,
+        callback = function(touchmenu_instance)
+            self:show_autostop_dialog(touchmenu_instance)
+        end
+    }}
+
     menu_items.filebrowserplus = {
-        text = _("FilebrowserPlus"),
+        text_func = function()
+            if self:isRunning() then
+                local ip = self:getIPAddress()
+                if ip then
+                    return T(_("FilebrowserPlus (%1:%2)"), ip, self.filebrowserplus_port)
+                else
+                    return T(_("FilebrowserPlus (:%1)"), self.filebrowserplus_port)
+                end
+
+            else
+                return _("FilebrowserPlus (Long press for settings)")
+            end
+        end,
         sorting_hint = "network",
         keep_menu_open = true,
-        sub_item_table = {{
-            text = _("FilebrowserPlus server"),
-            checked_func = function()
-                return self:isRunning()
-            end,
-            check_callback_updates_menu = true,
-            callback = function(touchmenu_instance)
-                self:onToggleFilebrowserPlusServer()
-                -- sleeping might not be needed, but it gives the feeling
-                -- something has been done and feedback is accurate
-                ffiutil.sleep(1)
-                touchmenu_instance:updateItems()
+        checked_func = function()
+            return self:isRunning()
+        end,
+        callback = function(touchmenu_instance)
+            self:onToggleFilebrowserPlusServer()
+            ffiutil.sleep(1)
+            touchmenu_instance:updateItems()
+        end,
+        hold_keep_menu_open = true,
+        hold_callback = function(touchmenu_instance)
+            local dummy_item = {
+                text = _("FilebrowserPlus settings"),
+                sub_item_table = sub_item_table
+            }
+            if touchmenu_instance.onMenuSelect then
+                touchmenu_instance:onMenuSelect(dummy_item)
+            else
+                local submenu = TouchMenu:new{
+                    title = _("FilebrowserPlus settings"),
+                    item_table = sub_item_table,
+                    parent = touchmenu_instance,
+                }
+                UIManager:show(submenu)
             end
-        }, {
-            text_func = function()
-                return T(_("FilebrowserPlus port (%1)"), self.filebrowserplus_port)
-            end,
-            keep_menu_open = true,
-            enabled_func = function()
-                return not self:isRunning()
-            end,
-            callback = function(touchmenu_instance)
-                self:show_port_dialog(touchmenu_instance)
-            end
-        }, {
-            text_func = function()
-                return T(_("FilebrowserPlus Data Path (%1)"), self.filebrowserplus_dataPath)
-            end,
-            keep_menu_open = true,
-            enabled_func = function()
-                return not self:isRunning()
-            end,
-            callback = function(touchmenu_instance)
-                self:show_dataPath_dialog(touchmenu_instance)
-            end
-        }, {
-            text = _("Reset Admin User Password"),
-            keep_menu_open = true,
-            enabled_func = function()
-                return not self:isRunning()
-            end,
-            callback = function(touchmenu_instance)
-                self:resetPassword()
-            end
-        }, {
-            text = _("Login without password (DANGEROUS)"),
-            checked_func = function()
-                return self.allow_no_password
-            end,
-            enabled_func = function()
-                return not self:isRunning()
-            end,
-            callback = function()
-                self.allow_no_password = not self.allow_no_password
-                G_reader_settings:flipNilOrFalse("FilebrowserPlus_allow_no_password")
-            end
-        }, {
-            text = _("Start FilebrowserPlus server with KOReader"),
-            checked_func = function()
-                return self.autostart
-            end,
-            enabled_func = function()
-                return not self:isRunning()
-            end,
-            callback = function()
-                self.autostart = not self.autostart
-                G_reader_settings:flipNilOrFalse("FilebrowserPlus_autostart")
-            end
-        }}
+        end
     }
 end
 

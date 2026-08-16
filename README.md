@@ -45,19 +45,27 @@ That’s it — the plugin will automatically use the new binary.
 1. Open KOReader’s top menu.
 2. Make sure your device is connected to Wi-Fi.
 3. Go to **Gearbox Menu → Network → FilebrowserPlus**.
-4. Adjust the configuration as needed:
+4. Open **FilebrowserPlus settings** (long press on FilebrowserPlus entry) and adjust configuration as needed:
    - **Data path:** defaults to `/`.
      - Note: On **Kindle**, only directories within `/mnt/us` (including `/mnt/us` itself) are writable.
      - On **Kobo**, only directories within `/mnt/onboard` (including `/mnt/onboard` itself) are writable.
      - ⚠️ **Important:** Paths outside these locations are **read-only**, and attempting to use them will prevent directory creation and cause the server to fail to start.
    - **Port:** defaults to `80`. If you get a permission error, try another port such as `8080`.
-5. Start the server.
+   - **Auto-stop timeout (min):** defaults to `30`.
+     - Set to `0` to disable auto-stop.
+5. Start the server with a normal tap on **FilebrowserPlus**.
    - Default username: `admin`
-   - Default password: `admin12345678`
-6. When the server starts, you’ll see the **IP address and port**.  
+   - Default password: `admin12345678` (shown on first setup)
+6. When running, the menu label shows **IP:port** when available.  
    Visit that address (e.g., `http://192.168.x.x:8080`) from your phone or computer connected to the same Wi-Fi network.
 7. You can change the password or create new users via the Filebrowser web interface.
-8. If you ever forget your password, press **“Reset Admin Password”** in the plugin menu — it will reset it to the default.
+8. If you ever forget your password, press **“Reset Admin User Password”** in the plugin settings — it resets to default.
+
+## Menu behavior
+
+- **Tap** on `FilebrowserPlus`: start/stop server quickly.
+- **Long press** on `FilebrowserPlus`: open plugin settings.
+- While running, menu text shows current connection endpoint (`IP:port` when available).
 
 ## Why not use the existing [filebrowser.koplugin](https://github.com/b-/filebrowser.koplugin)?
 
@@ -73,6 +81,7 @@ Compared to the original plugin, FilebrowserPlus adds:
 - Reset admin password directly from KOReader
 - Configurable authentication (the original had auth disabled by default)
 - Option to auto-start with KOReader
+- Configurable auto-stop timeout (including disable option)
 
 ## Compatibility
 
