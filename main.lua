@@ -156,7 +156,22 @@ function FilebrowserPlus:closeQRScreen()
     end
 end
 
-function FilebrowserPlus:showQRCode()
+-- Refresh the menu widget (and any parent menus) so that state-dependent UI
+-- such as the running-state checkmark on the top-level item updates after the
+-- server is stopped from inside the QR screen. TouchMenu instances that are no
+-- longer mounted are harmless to call updateItems() on: KOReader simply skips
+-- the repaint when the widget is not in the UI stack.
+local function refreshMenus(instance)
+    local current = instance
+    while current do
+        if type(current.updateItems) == "function" then
+            current:updateItems()
+        end
+        current = current.parent
+    end
+end
+
+function FilebrowserPlus:showQRCode(touchmenu_instance)
     if not self:isRunning() then
         UIManager:show(InfoMessage:new{
             text = _("FilebrowserPlus server is not running."),
@@ -350,6 +365,7 @@ function FilebrowserPlus:showQRCode()
                 })
                 UIManager:scheduleIn(0.5, function()
                     self._manager:stop()
+                    refreshMenus(touchmenu_instance)
                 end)
                 return true
             end
@@ -373,6 +389,7 @@ function FilebrowserPlus:showQRCode()
                         })
                         UIManager:scheduleIn(0.5, function()
                             manager:stop()
+                            refreshMenus(touchmenu_instance)
                         end)
                     end,
                     cancel_callback = function()
@@ -394,7 +411,7 @@ function FilebrowserPlus:showQRCode()
     UIManager:show(widget, "full")
 end
 
-function FilebrowserPlus:start()
+function FilebrowserPlus:start(touchmenu_instance)
 
     if Device:isKindle() then
         os.execute(string.format("%s %s %s", "iptables -A INPUT -p tcp --dport", self.filebrowserplus_port,
@@ -466,7 +483,7 @@ function FilebrowserPlus:start()
 
         if self.auto_show_qr then
             -- QR screen already contains the URL and default credentials.
-            self:showQRCode()
+            self:showQRCode(touchmenu_instance)
         else
             local info = InfoMessage:new{
                 timeout = timeout_duration,
@@ -587,11 +604,11 @@ function FilebrowserPlus:stop(is_auto)
 
 end
 
-function FilebrowserPlus:onToggleFilebrowserPlusServer()
+function FilebrowserPlus:onToggleFilebrowserPlusServer(touchmenu_instance)
     if self:isRunning() then
         self:stop()
     else
-        self:start()
+        self:start(touchmenu_instance)
     end
 end
 
@@ -703,8 +720,8 @@ function FilebrowserPlus:addToMainMenu(menu_items)
         enabled_func = function()
             return self:isRunning()
         end,
-        callback = function()
-            self:showQRCode()
+        callback = function(touchmenu_instance)
+            self:showQRCode(touchmenu_instance)
         end,
         keep_menu_open = false,
     }, {
@@ -808,7 +825,7 @@ function FilebrowserPlus:addToMainMenu(menu_items)
             return self:isRunning()
         end,
         callback = function(touchmenu_instance)
-            self:onToggleFilebrowserPlusServer()
+            self:onToggleFilebrowserPlusServer(touchmenu_instance)
             ffiutil.sleep(1)
             touchmenu_instance:updateItems()
         end,
