@@ -2,13 +2,33 @@
 -- for KOReader, licensed under the GNU AGPLv3.
 -- Modifications and extensions © 2025 [Neeraj Patel].
 local BD = require("ui/bidi")
+local Blitbuffer = require("ffi/blitbuffer")
+local CenterContainer = require("ui/widget/container/centercontainer")
+local ConfirmBox = require("ui/widget/confirmbox")
 local DataStorage = require("datastorage")
 local Device = require("device")
 local Dispatcher = require("dispatcher")
+local Font = require("ui/font")
+local FrameContainer = require("ui/widget/container/framecontainer")
+local Geom = require("ui/geometry")
+local GestureRange = require("ui/gesturerange")
+local HorizontalGroup = require("ui/widget/horizontalgroup")
+local HorizontalSpan = require("ui/widget/horizontalspan")
+local ImageWidget = require("ui/widget/imagewidget")
 local InfoMessage = require("ui/widget/infomessage") -- luacheck:ignore
+local InputContainer = require("ui/widget/container/inputcontainer")
 local InputDialog = require("ui/widget/inputdialog")
-local UIManager = require("ui/uimanager")
+local NetworkMgr = require("ui/network/manager")
+local OverlapGroup = require("ui/widget/overlapgroup")
+local QRWidget = require("ui/widget/qrwidget")
+local RightContainer = require("ui/widget/container/rightcontainer")
+local Size = require("ui/size")
+local TextBoxWidget = require("ui/widget/textboxwidget")
+local TextWidget = require("ui/widget/textwidget")
 local TouchMenu = require("ui/widget/touchmenu")
+local UIManager = require("ui/uimanager")
+local VerticalGroup = require("ui/widget/verticalgroup")
+local VerticalSpan = require("ui/widget/verticalspan")
 local WidgetContainer = require("ui/widget/container/widgetcontainer")
 local ffiutil = require("ffi/util")
 local logger = require("logger")
@@ -26,6 +46,7 @@ local silence_cmd = ""
 silence_cmd = " > /dev/null 2>&1"
 local pid_path = "/tmp/filebrowserplus_koreader.pid"
 local bin_path = plugin_path .. "/filebrowser"
+local Screen = Device.screen
 
 local filebrowser_args = string.format("-d %s -c %s ", db_path, config_path)
 local filebrowser_cmd = bin_path .. " " .. filebrowser_args
@@ -57,6 +78,9 @@ function FilebrowserPlus:init()
         self:checkAutoStop()
     end
     self.auto_stop_scheduled = false
+    self.auto_show_qr = G_reader_settings:isTrue("FilebrowserPlus_auto_show_qr")
+    self._qr_widget = nil
+
     if self.autostart then
         logger.info("[FilebrowserPlus] Autostart enabled, starting server on port " .. self.filebrowserplus_port)
         self:start()
@@ -125,7 +149,269 @@ function FilebrowserPlus:resetPassword()
     end
 end
 
-function FilebrowserPlus:start()
+function FilebrowserPlus:closeQRScreen()
+    if self._qr_widget then
+        UIManager:close(self._qr_widget, "full")
+        self._qr_widget = nil
+    end
+end
+
+-- Refresh the menu widget (and any parent menus) so that state-dependent UI
+-- such as the running-state checkmark on the top-level item updates after the
+-- server is stopped from inside the QR screen. TouchMenu instances that are no
+-- longer mounted are harmless to call updateItems() on: KOReader simply skips
+-- the repaint when the widget is not in the UI stack.
+local function refreshMenus(instance)
+    local current = instance
+    while current do
+        if type(current.updateItems) == "function" then
+            current:updateItems()
+        end
+        current = current.parent
+    end
+end
+
+function FilebrowserPlus:showQRCode(touchmenu_instance)
+    if not self:isRunning() then
+        UIManager:show(InfoMessage:new{
+            text = _("FilebrowserPlus server is not running."),
+            timeout = 2,
+        })
+        return
+    end
+
+    -- Use the same IP getter as the main menu for consistency.
+    local ip = self:getIPAddress()
+
+    if not ip then
+        logger.warn("[FilebrowserPlus] showQRCode: failed to get IP, showing manual input hint")
+        UIManager:show(InfoMessage:new{
+            text = _("Server started, but could not automatically get the IP address.\nPlease manually enter the device IP and port in your browser.\n\nHint: port is ") .. tostring(self.filebrowserplus_port),
+            timeout = 5,
+        })
+        return
+    end
+
+    self:closeQRScreen()
+
+    local port = self.filebrowserplus_port
+    local url = "http://" .. ip .. ":" .. port
+    local screen_width = Screen:getWidth()
+    local screen_height = Screen:getHeight()
+
+    local qr_size = Screen:scaleBySize(260)
+    local qr_widget = QRWidget:new{
+        text = url,
+        width = qr_size,
+        height = qr_size,
+    }
+
+    local icon_path = plugin_path .. "/../icon.png"
+    if not util.pathExists(icon_path) then
+        icon_path = nil
+    end
+    local icon_widget = nil
+    if icon_path then
+        local icon_size = Screen:scaleBySize(36)
+        icon_widget = ImageWidget:new{
+            file = icon_path,
+            width = icon_size,
+            height = icon_size,
+            alpha = true,
+        }
+    end
+
+    local title_text = TextWidget:new{
+        text = _("FilebrowserPlus"),
+        face = Font:getFace("infofont", 48),
+        bold = true,
+        fgcolor = Blitbuffer.COLOR_BLACK,
+    }
+
+    local title_widget
+    if icon_widget then
+        title_widget = HorizontalGroup:new{
+            align = "center",
+            icon_widget,
+            HorizontalSpan:new{ width = Screen:scaleBySize(10) },
+            title_text,
+        }
+    else
+        title_widget = title_text
+    end
+
+    local url_widget = TextWidget:new{
+        text = url,
+        face = Font:getFace("infofont", 22),
+        fgcolor = Blitbuffer.COLOR_BLACK,
+        max_width = screen_width - Screen:scaleBySize(40),
+    }
+
+    local instructions_widget = TextBoxWidget:new{
+        text = _("Scan the QR code or enter the URL in your browser\n\nBoth devices must be on the same Wi-Fi network\n\nDefault username: admin\nDefault password: admin12345678"),
+        face = Font:getFace("smallinfofont", 20),
+        width = screen_width * 0.65,
+        alignment = "center",
+        fgcolor = Blitbuffer.COLOR_BLACK,
+    }
+
+    local button_text = TextWidget:new{
+        text = _("Stop server"),
+        face = Font:getFace("infofont", 20),
+        fgcolor = Blitbuffer.COLOR_BLACK,
+    }
+    local stop_button = FrameContainer:new{
+        bordersize = Size.border.button,
+        radius = Size.radius.button,
+        padding = Screen:scaleBySize(10),
+        padding_left = Screen:scaleBySize(30),
+        padding_right = Screen:scaleBySize(30),
+        background = Blitbuffer.COLOR_WHITE,
+        button_text,
+    }
+
+    local vertical_content = VerticalGroup:new{
+        align = "center",
+        VerticalSpan:new{ width = Screen:scaleBySize(40) },
+        title_widget,
+        VerticalSpan:new{ width = Screen:scaleBySize(30) },
+        qr_widget,
+        VerticalSpan:new{ width = Screen:scaleBySize(20) },
+        url_widget,
+        VerticalSpan:new{ width = Screen:scaleBySize(15) },
+        instructions_widget,
+        VerticalSpan:new{ width = Screen:scaleBySize(30) },
+        stop_button,
+    }
+
+    local close_button_text = TextWidget:new{
+        text = "\u{00D7}",
+        face = Font:getFace("infofont", 32),
+        fgcolor = Blitbuffer.COLOR_BLACK,
+    }
+    local close_button = FrameContainer:new{
+        bordersize = Size.border.button,
+        radius = Size.radius.button,
+        padding = Screen:scaleBySize(6),
+        padding_left = Screen:scaleBySize(12),
+        padding_right = Screen:scaleBySize(12),
+        background = Blitbuffer.COLOR_WHITE,
+        close_button_text,
+    }
+    local close_button_row = RightContainer:new{
+        dimen = { w = screen_width - Screen:scaleBySize(10), h = close_button:getSize().h + Screen:scaleBySize(10) },
+        FrameContainer:new{
+            bordersize = 0,
+            padding = 0,
+            padding_top = Screen:scaleBySize(10),
+            padding_right = Screen:scaleBySize(10),
+            background = Blitbuffer.COLOR_WHITE,
+            close_button,
+        },
+    }
+
+    local centered_content = CenterContainer:new{
+        dimen = { w = screen_width, h = screen_height },
+        vertical_content,
+    }
+
+    local overlap = OverlapGroup:new{
+        dimen = { w = screen_width, h = screen_height },
+        centered_content,
+        close_button_row,
+    }
+
+    local frame = FrameContainer:new{
+        width = screen_width,
+        height = screen_height,
+        bordersize = 0,
+        padding = 0,
+        margin = 0,
+        background = Blitbuffer.COLOR_WHITE,
+        overlap,
+    }
+
+    local widget = InputContainer:new{
+        width = screen_width,
+        height = screen_height,
+    }
+    widget[1] = frame
+
+    widget._stop_button = stop_button
+    widget._close_button = close_button
+    widget._manager = self
+
+    widget.ges_events = {
+        Tap = {
+            GestureRange:new{
+                ges = "tap",
+                range = Geom:new{ x = 0, y = 0, w = screen_width, h = screen_height },
+            },
+        },
+    }
+
+    function widget:onTap(_event, ges)
+        if not ges then return true end
+        local x, y = ges.pos.x, ges.pos.y
+
+        local btn = self._stop_button
+        if btn.dimen then
+            if x >= btn.dimen.x and x <= btn.dimen.x + btn.dimen.w
+               and y >= btn.dimen.y and y <= btn.dimen.y + btn.dimen.h then
+                self._manager:closeQRScreen()
+                UIManager:show(InfoMessage:new{
+                    text = _("Stopping server..."),
+                    timeout = 2,
+                })
+                UIManager:scheduleIn(0.5, function()
+                    self._manager:stop()
+                    refreshMenus(touchmenu_instance)
+                end)
+                return true
+            end
+        end
+
+        local close_btn = self._close_button
+        if close_btn.dimen then
+            if x >= close_btn.dimen.x and x <= close_btn.dimen.x + close_btn.dimen.w
+               and y >= close_btn.dimen.y and y <= close_btn.dimen.y + close_btn.dimen.h then
+                local manager = self._manager
+                UIManager:show(ConfirmBox:new{
+                    title = _("File server is running"),
+                    text = _("The server will keep running in the background. What do you want to do?"),
+                    ok_text = _("Stop server"),
+                    cancel_text = _("Keep running"),
+                    ok_callback = function()
+                        manager:closeQRScreen()
+                        UIManager:show(InfoMessage:new{
+                            text = _("Stopping server..."),
+                            timeout = 2,
+                        })
+                        UIManager:scheduleIn(0.5, function()
+                            manager:stop()
+                            refreshMenus(touchmenu_instance)
+                        end)
+                    end,
+                    cancel_callback = function()
+                        manager:closeQRScreen()
+                    end,
+                })
+                return true
+            end
+        end
+
+        return true
+    end
+
+    function widget:onClose()
+        return true
+    end
+
+    self._qr_widget = widget
+    UIManager:show(widget, "full")
+end
+
+function FilebrowserPlus:start(touchmenu_instance)
 
     if Device:isKindle() then
         os.execute(string.format("%s %s %s", "iptables -A INPUT -p tcp --dport", self.filebrowserplus_port,
@@ -138,7 +424,7 @@ function FilebrowserPlus:start()
         logger.dbg("[FilebrowserPlus] Not starting FilebrowserPlus, already running.")
         return
     end
-    
+
     if not util.fileExists(db_path) then
         self.filebrowserplus_first_setup = true
         self:config()
@@ -195,12 +481,17 @@ function FilebrowserPlus:start()
             auto_stop_msg = "\n" .. T(_("Auto-stop in %1 min"), self.auto_stop_minutes)
         end
 
-        local info = InfoMessage:new{
-            timeout = timeout_duration,
-            text = _("FilebrowserPlus server started.") .. auto_stop_msg .. extra_info
-        }
-        UIManager:show(info)
-        
+        if self.auto_show_qr then
+            -- QR screen already contains the URL and default credentials.
+            self:showQRCode(touchmenu_instance)
+        else
+            local info = InfoMessage:new{
+                timeout = timeout_duration,
+                text = _("FilebrowserPlus server started.") .. auto_stop_msg .. extra_info
+            }
+            UIManager:show(info)
+        end
+
         -- Schedule auto-stop if configured
         if self.auto_stop_minutes and self.auto_stop_minutes > 0 then
             self.stop_deadline = os.time() + (self.auto_stop_minutes * 60)
@@ -280,8 +571,8 @@ function FilebrowserPlus:stop(is_auto)
         UIManager:unschedule(self.auto_stop_task)
         self.auto_stop_scheduled = false
     end
-    self.stop_deadline = nil    
-    
+    self.stop_deadline = nil
+
     local cmd = string.format("if [ -f '%s' ]; then kill $(cat '%s') 2>/dev/null; rm -f '%s'; fi", pid_path, pid_path,
         pid_path)
     logger.info("[FilebrowserPlus] Stopping Filebrowser:", cmd)
@@ -313,11 +604,11 @@ function FilebrowserPlus:stop(is_auto)
 
 end
 
-function FilebrowserPlus:onToggleFilebrowserPlusServer()
+function FilebrowserPlus:onToggleFilebrowserPlusServer(touchmenu_instance)
     if self:isRunning() then
         self:stop()
     else
-        self:start()
+        self:start(touchmenu_instance)
     end
 end
 
@@ -425,6 +716,15 @@ end
 
 function FilebrowserPlus:addToMainMenu(menu_items)
     local sub_item_table = {{
+        text = _("Show QR code"),
+        enabled_func = function()
+            return self:isRunning()
+        end,
+        callback = function(touchmenu_instance)
+            self:showQRCode(touchmenu_instance)
+        end,
+        keep_menu_open = false,
+    }, {
         text_func = function()
             return T(_("FilebrowserPlus port (%1)"), self.filebrowserplus_port)
         end,
@@ -480,6 +780,15 @@ function FilebrowserPlus:addToMainMenu(menu_items)
             G_reader_settings:flipNilOrFalse("FilebrowserPlus_autostart")
         end
     }, {
+        text = _("Show QR code on start"),
+        checked_func = function()
+            return self.auto_show_qr
+        end,
+        callback = function()
+            self.auto_show_qr = not self.auto_show_qr
+            G_reader_settings:saveSetting("FilebrowserPlus_auto_show_qr", self.auto_show_qr)
+        end
+    }, {
         text_func = function()
             if self.auto_stop_minutes and self.auto_stop_minutes > 0 then
                 return T(_("Auto-stop timeout (%1 min)"), self.auto_stop_minutes)
@@ -516,7 +825,7 @@ function FilebrowserPlus:addToMainMenu(menu_items)
             return self:isRunning()
         end,
         callback = function(touchmenu_instance)
-            self:onToggleFilebrowserPlusServer()
+            self:onToggleFilebrowserPlusServer(touchmenu_instance)
             ffiutil.sleep(1)
             touchmenu_instance:updateItems()
         end,
