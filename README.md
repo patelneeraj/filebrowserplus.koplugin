@@ -1,3 +1,21 @@
+> ## ⚠️ This project is archived
+>
+> **FilebrowserPlus is no longer maintained.**
+>
+> This repository is being archived because the underlying [File Browser](https://github.com/filebrowser/filebrowser) project is no longer actively maintained and is itself being archived. As a result, continuing to build FilebrowserPlus around it does not make sense for the long term.
+>
+> If you are looking for a wireless file manager for KOReader, there are now newer projects that are actively developed and provide a more complete experience:
+>
+> - **[FileSync](https://github.com/abrahamnm/filesync.koplugin)** — a dedicated KOReader wireless file manager with ongoing development.
+> - **[Zen-FM](https://github.com/xZenLabs/zen-fm)** — another actively developed alternative worth considering.
+>
+> This repository is kept available for **historical/reference purposes**. Existing releases may continue to work, but there will be **no further feature development, bug fixes, or maintenance** here.
+>
+> **Please do not open new issues or pull requests expecting them to be addressed.** Existing issues and pull requests have intentionally been left visible as part of the project's history.
+>
+> Thank you to everyone who used, tested, reported issues, contributed to, or otherwise supported FilebrowserPlus.
+
+
 # FilebrowserPlus Plugin for KOReader
 
 >[!IMPORTANT]
